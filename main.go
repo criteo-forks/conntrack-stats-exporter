@@ -17,22 +17,12 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"flag"
-	"fmt"
-	"net/http"
 	"os"
-	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"strings"
-	"sync"
-	"syscall"
-	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/jwkohnen/conntrack-stats-exporter/exporter"
@@ -61,59 +51,45 @@ func main() {
 	flag.StringVar(&netns, "netns", netns, "List of netns names separated by comma")
 	flag.Parse()
 
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(exporter.New(strings.Split(netns, ",")))
+	exporter := exporter.New(addr, strings.Split(netns, ","))
+	// shutdown := make(chan os.Signal, 1)
 
-	mux := http.NewServeMux()
-	mux.Handle(
-		path,
-		newAbortHandler(
-			promhttp.HandlerFor(reg, promhttp.HandlerOpts{}),
-		),
-	)
+	// var receivedSignal os.Signal
 
-	srv := &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  3e9,
-		WriteTimeout: 3e9,
-	}
+	// var wg sync.WaitGroup
+	// wg.Add(1)
 
-	shutdown := make(chan os.Signal, 1)
+	// go func() {
+	// 	defer wg.Done()
 
-	var receivedSignal os.Signal
+	// 	// Sadly Kubernetes sends SIGTERM, not SIGINT.  CTRL+C on a TTY sends SIGINT.
+	// 	signal.Notify(shutdown, os.Interrupt)
+	// 	signal.Notify(shutdown, syscall.SIGTERM)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// 	receivedSignal = <-shutdown
 
-	go func() {
-		defer wg.Done()
+	// 	signal.Stop(shutdown)
 
-		// Sadly Kubernetes sends SIGTERM, not SIGINT.  CTRL+C on a TTY sends SIGINT.
-		signal.Notify(shutdown, os.Interrupt)
-		signal.Notify(shutdown, syscall.SIGTERM)
+	// 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// 	defer cancel()
 
-		receivedSignal = <-shutdown
+	// 	if err := srv.Shutdown(shutdownCtx); err != nil {
+	// 		abort(fmt.Errorf("error shutting down server: %w", err))
+	// 	}
+	// }()
 
-		signal.Stop(shutdown)
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			abort(fmt.Errorf("error shutting down server: %w", err))
-		}
-	}()
+	// wg.Wait()
 
 	log.Infof("Listening for %s on %s", path, addr)
-	err := srv.ListenAndServe()
-	wg.Wait()
-
-	if errors.Is(err, http.ErrServerClosed) {
-		os.Exit(128 + int(receivedSignal.(syscall.Signal)))
+	err := exporter.Run()
+	if err != nil {
+		log.Fatal(err)
 	}
+	// if errors.Is(err, http.ErrServerClosed) {
+	// 	os.Exit(128 + int(receivedSignal.(syscall.Signal)))
+	// }
 
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		abort(err)
-	}
+	// if err != nil && !errors.Is(err, http.ErrServerClosed) {
+	// 	abort(err)
+	// }
 }

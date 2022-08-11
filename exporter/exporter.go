@@ -21,11 +21,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"os/exec"
 	"regexp"
 	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -36,94 +38,135 @@ const (
 
 var regex = regexp.MustCompile(`([a-z_]+)=(\d+)`)
 
-var metricNames = map[string][]string{
-	"found":          {"cpu", "netns"},
-	"invalid":        {"cpu", "netns"},
-	"ignore":         {"cpu", "netns"},
-	"insert":         {"cpu", "netns"},
-	"insert_failed":  {"cpu", "netns"},
-	"drop":           {"cpu", "netns"},
-	"early_drop":     {"cpu", "netns"},
-	"error":          {"cpu", "netns"},
-	"search_restart": {"cpu", "netns"},
-	"count":          {"netns"},
-}
+var (
+	conntrackStatsFound = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: fmt.Sprintf("%s_%s_found", promNamespace, promSubSystem),
+		Help: "Total of conntrack found",
+	}, []string{"cpu", "netns"})
+	conntrackStatsInvalid = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: fmt.Sprintf("%s_%s_invalid", promNamespace, promSubSystem),
+		Help: "Total of conntrack invalid",
+	}, []string{"cpu", "netns"})
+	conntrackStatsIgnore = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: fmt.Sprintf("%s_%s_ignore", promNamespace, promSubSystem),
+		Help: "Total of conntrack ignore",
+	}, []string{"cpu", "netns"})
+	conntrackStatsInsert = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: fmt.Sprintf("%s_%s_insert", promNamespace, promSubSystem),
+		Help: "Total of conntrack insert",
+	}, []string{"cpu", "netns"})
+	conntrackStatsInsertFailed = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: fmt.Sprintf("%s_%s_insert_failed", promNamespace, promSubSystem),
+		Help: "Total of conntrack insert_failed",
+	}, []string{"cpu", "netns"})
+	conntrackStatsDrop = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: fmt.Sprintf("%s_%s_drop", promNamespace, promSubSystem),
+		Help: "Total of conntrack drop",
+	}, []string{"cpu", "netns"})
+	conntrackStatsEarlyDrop = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: fmt.Sprintf("%s_%s_early_drop", promNamespace, promSubSystem),
+		Help: "Total of conntrack early_drop",
+	}, []string{"cpu", "netns"})
+	conntrackStatsError = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: fmt.Sprintf("%s_%s_error", promNamespace, promSubSystem),
+		Help: "Total of conntrack error",
+	}, []string{"cpu", "netns"})
+	conntrackStatsSearchRestart = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: fmt.Sprintf("%s_%s_search_restart", promNamespace, promSubSystem),
+		Help: "Total of conntrack search_restart",
+	}, []string{"cpu", "netns"})
+	conntrackStatsCount = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: fmt.Sprintf("%s_%s_count", promNamespace, promSubSystem),
+		Help: "Total of conntrack count",
+	}, []string{"netns"})
+	conntrackScrapeError = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: fmt.Sprintf("%s_%s_scrape_error", promNamespace, promSubSystem),
+		Help: "Total of conntrack count",
+	}, []string{"netns"})
+)
 
 type metricList []map[string]int
 
 // Exporter exports stats from the conntrack CLI. The metrics are named with
 // prefix `conntrack_stats_*`.
 type Exporter struct {
-	descriptors map[string]*prometheus.Desc
-	scrapeError map[string]int
+	listenAddr  string
+	promHandler http.Handler
 	netnsList   []string
 }
 
 // New creates a new conntrack stats exporter.
-func New(netnsList []string) *Exporter {
-	scrapeError := make(map[string]int, len(netnsList))
-	for _, netns := range netnsList {
-		scrapeError[netns] = 0
+func New(listenAddr string, netnsList []string) *Exporter {
+	e := &Exporter{
+		listenAddr:  listenAddr,
+		promHandler: promhttp.Handler(),
+		netnsList:   netnsList,
 	}
-	e := &Exporter{descriptors: make(map[string]*prometheus.Desc, len(metricNames)), scrapeError: scrapeError, netnsList: netnsList}
-	e.descriptors["scrape_error"] = prometheus.NewDesc(
-		prometheus.BuildFQName(promNamespace, promSubSystem, "scrape_error"),
-		"Total of error when calling/parsing conntrack command",
-		[]string{"netns"},
-		nil,
-	)
-	for metricName, metricLabels := range metricNames {
-		e.descriptors[metricName] = prometheus.NewDesc(
-			prometheus.BuildFQName(promNamespace, promSubSystem, metricName),
-			"Total of conntrack "+metricName,
-			metricLabels,
-			nil,
-		)
-	}
-
 	return e
 }
 
-// Describe implements the describe method of the prometheus.Collector
-// interface.
-func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
-	for _, g := range e.descriptors {
-		ch <- g
-	}
+func (e *Exporter) Run() error {
+	prometheus.MustRegister(conntrackStatsFound)
+	prometheus.MustRegister(conntrackStatsInvalid)
+	prometheus.MustRegister(conntrackStatsIgnore)
+	prometheus.MustRegister(conntrackStatsInsert)
+	prometheus.MustRegister(conntrackStatsInsertFailed)
+	prometheus.MustRegister(conntrackStatsDrop)
+	prometheus.MustRegister(conntrackStatsEarlyDrop)
+	prometheus.MustRegister(conntrackStatsError)
+	prometheus.MustRegister(conntrackStatsSearchRestart)
+	prometheus.MustRegister(conntrackStatsCount)
+	prometheus.MustRegister(conntrackScrapeError)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", e.metricsHandler)
+
+	return http.ListenAndServe(e.listenAddr, mux)
 }
 
-// Collect implements the collect method of the prometheus.Collector interface.
-func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
+func (e *Exporter) metricsHandler(rw http.ResponseWriter, r *http.Request) {
+	e.update()
+	e.promHandler.ServeHTTP(rw, r)
+}
+
+// update get conntrack stats and update prometheus metrics.
+func (e *Exporter) update() {
 	metricsPerNetns := make(map[string]metricList)
 	var err error
 	for _, netns := range e.netnsList {
 		metricsPerNetns[netns], err = getMetrics(netns)
 		if err != nil {
-			e.scrapeError[netns]++
+			conntrackScrapeError.WithLabelValues(netns).Inc()
 			log.Errorf("failed to get conntrack metrics netns: %s", err)
 		}
-		metricsPerNetns[netns] = append(metricsPerNetns[netns], map[string]int{"scrape_error": e.scrapeError[netns]})
-	}
-	for metricName, desc := range e.descriptors {
-		for netns, metrics := range metricsPerNetns {
-			for _, metric := range metrics {
-				metricValue, ok := metric[metricName]
-				if !ok {
-					continue
+		for _, metrics := range metricsPerNetns[netns] {
+			cpu := strconv.Itoa(metrics["cpu"])
+			for metricName, value := range metrics {
+				switch metricName {
+				case "found":
+					conntrackStatsFound.WithLabelValues(cpu, netns).Set(float64(value))
+				case "invalid":
+					conntrackStatsInvalid.WithLabelValues(cpu, netns).Set(float64(value))
+				case "ignore":
+					conntrackStatsIgnore.WithLabelValues(cpu, netns).Set(float64(value))
+				case "insert":
+					conntrackStatsInsert.WithLabelValues(cpu, netns).Set(float64(value))
+				case "insert_failed":
+					conntrackStatsInsertFailed.WithLabelValues(cpu, netns).Set(float64(value))
+				case "drop":
+					conntrackStatsDrop.WithLabelValues(cpu, netns).Set(float64(value))
+				case "early_drop":
+					conntrackStatsEarlyDrop.WithLabelValues(cpu, netns).Set(float64(value))
+				case "error":
+					conntrackStatsError.WithLabelValues(cpu, netns).Set(float64(value))
+				case "search_restart":
+					conntrackStatsSearchRestart.WithLabelValues(cpu, netns).Set(float64(value))
+				case "count":
+					conntrackStatsCount.WithLabelValues(netns).Set(float64(value))
+				default:
 				}
-				labels := []string{netns}
-				cpu, ok := metric["cpu"]
-				if ok {
-					labels = append([]string{strconv.Itoa(cpu)}, labels...)
-				}
-				ch <- prometheus.MustNewConstMetric(
-					desc,
-					prometheus.CounterValue,
-					float64(metricValue),
-					labels...,
-				)
 			}
 		}
+
 	}
 }
 
